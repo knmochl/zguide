@@ -27,13 +27,13 @@ workerTask broker = do
         receive worker >>= \msg -> liftIO $ putStrLn $ unwords ["Worker:", (unpack msg)]
         send worker [] $ pack "OK"
 
-handleCloud :: (Receiver a) => Socket a -> [Event] -> ZMQ z ()
+handleCloud :: (Receiver a) => Socket z a -> [Event] -> ZMQ z ()
 handleCloud sock evts = do
     when (In `elem` evts) $ do
         msg <- unpack <$> receive sock
         return ()
 
-handleLocal :: (Receiver a) => Socket a -> [Event] -> ZMQ z ()
+handleLocal :: (Receiver a) => Socket z a -> [Event] -> ZMQ z ()
 handleLocal sock evts = do
     when (In `elem` evts) $ do
         msg <- unpack <$> receive sock
@@ -61,7 +61,7 @@ main = do
         liftIO $ putStrLn "Press Enter when all brokers are started: "
         _ <- liftIO $ getLine
         forever $ do
-            poll 1000 [Sock localBack [In] Just $ handleLocal localBack,
-                       Sock cloudBack [In] Just $ handleCloud cloudBack]
+            poll 1000 [Sock localBack [In] (Just $ handleLocal localBack),
+                       Sock cloudBack [In] (Just $ handleCloud cloudBack)]
 
         liftIO $ putStrLn "Done" 
