@@ -2,6 +2,7 @@ import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
 import Data.ByteString.Char8 (pack, unpack)
 import Data.Char (chr)
+import Data.List.NonEmpty (fromList)
 import Control.Monad (forM_, forever, when)
 import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
@@ -9,7 +10,20 @@ import Text.Printf
 import System.Random (getStdRandom, randomR)
 import System.ZMQ3.Monadic
 
-clientTask :: String -> ZMQ z ()
+type Worker = String
+type Broker = String
+
+data SocketGroup z a = SocketGroup {
+      localFE :: Socket z a
+    , localBE :: Socket z a
+    , cloudFE :: Socket z a
+    , cloudBE :: Socket z a
+}
+
+receiveMessage :: (Receiver a) => Socket z a -> ZMQ z [String]
+receiveMessage sock = map unpack <$> receiveMulti sock
+
+clientTask :: Broker -> ZMQ z ()
 clientTask broker = do
     client <- socket Req
     connect client $ "ipc://" ++ broker ++ "-localfe.ipc"
@@ -18,7 +32,7 @@ clientTask broker = do
         receive client >>= \msg -> liftIO $ putStrLn $ unwords ["Client:", (unpack msg)]
         liftIO $ threadDelay $ 1 * 1000
 
-workerTask :: String -> ZMQ z ()
+workerTask :: Broker -> ZMQ z ()
 workerTask broker = do
     worker <- socket Req
     connect worker $ "ipc://" ++ broker ++ "-localbe.ipc"
@@ -27,17 +41,54 @@ workerTask broker = do
         receive worker >>= \msg -> liftIO $ putStrLn $ unwords ["Worker:", (unpack msg)]
         send worker [] $ pack "OK"
 
-handleCloud :: (Receiver a) => Socket z a -> [Event] -> ZMQ z ()
-handleCloud sock evts = do
+handleCloud :: (Receiver a, Sender a) => [Broker] -> SocketGroup z a -> [Event] -> ZMQ z ()
+handleCloud peers sockets evts = do
     when (In `elem` evts) $ do
-        msg <- unpack <$> receive sock
+        msg <- map unpack <$> receiveMulti (cloudBE sockets)
+        let msg' = tail msg
+        routeMessage peers (localFE sockets) (cloudFE sockets) msg'
         return ()
 
-handleLocal :: (Receiver a) => Socket z a -> [Event] -> ZMQ z ()
-handleLocal sock evts = do
+handleLocal :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> [Event] -> ZMQ z ()
+handleLocal peers workers sockets evts = do
     when (In `elem` evts) $ do
-        msg <- unpack <$> receive sock
+        msg <- map unpack <$> receiveMulti (localBE sockets)
+        let workerName = head msg
+            msg' = tail msg
+        when (head msg' /= [chr 1]) $ do
+            routeMessage peers (localFE sockets) (cloudFE sockets) msg'
+        routeClients peers workers sockets
         return ()
+
+routeClients :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z ()
+routeClients peers [] sockets = return ()
+routeClients peers workers sockets = do
+    [evtsL, evtsC] <- poll 1000 [Sock (localFE sockets) [In] Nothing,
+                                 Sock (cloudFE sockets) [In] Nothing]
+    if In `elem` evtsC then do
+        msg <- receiveMessage (cloudFE sockets)
+        sendToWorker (localBE sockets) (head workers) msg
+        routeClients peers (tail workers) sockets
+    else
+        return ()
+
+sendToWorker :: (Sender a) => Socket z a -> Worker -> [String] -> ZMQ z ()
+sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : msg
+
+routeMessage :: (Sender a) => [Broker] -> Socket z a -> Socket z a -> [String] -> ZMQ z ()
+routeMessage peers localFront cloudFront msg = do
+    let msg' = map pack $ msg
+    if (head msg `elem` peers) then
+        sendMulti cloudFront (fromList msg')
+    else
+        sendMulti localFront (fromList msg')
+
+routeTraffic :: (Receiver a, Sender a) => [Worker] -> [Broker] -> SocketGroup z a -> ZMQ z ()
+routeTraffic workers peers sockets = forever $ do
+    let localBack  = localBE sockets
+        cloudBack  = cloudBE sockets
+    poll 1000 [Sock localBack [In] (Just $ handleLocal peers workers sockets),
+               Sock cloudBack [In] (Just $ handleCloud peers sockets)]
 
 main = do
     args <- getArgs
@@ -50,7 +101,7 @@ main = do
     putStrLn $ printf "I: preparing broker at %s..." me
     runZMQ $ do
         cloudFront <- socket Router
-        --setIdentity (pack me) cloudFront
+        setIdentity (restrict $ pack me) cloudFront
         bind cloudFront $ "ipc://" ++ me ++ "-cloud.ipc"
         cloudBack <- socket Router
         forM_ peers $ \i -> connect cloudBack $ "ipc://" ++ i ++ "-cloud.ipc"
@@ -58,10 +109,9 @@ main = do
         bind localFront $ "ipc://" ++ me ++ "-localfe.ipc"
         localBack <- socket Router
         bind localBack $ "ipc://" ++ me ++ "-localbe.ipc"
+        let sockets = SocketGroup localFront localBack cloudFront cloudBack
         liftIO $ putStrLn "Press Enter when all brokers are started: "
         _ <- liftIO $ getLine
-        forever $ do
-            poll 1000 [Sock localBack [In] (Just $ handleLocal localBack),
-                       Sock cloudBack [In] (Just $ handleCloud cloudBack)]
+        routeTraffic [] peers sockets
 
         liftIO $ putStrLn "Done" 
