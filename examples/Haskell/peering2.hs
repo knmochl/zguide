@@ -28,8 +28,10 @@ receiveMessage sock = map unpack <$> receiveMulti sock
 
 clientTask :: Broker -> ZMQ z ()
 clientTask broker = do
-    liftIO $ putStrLn "2: Client started"
     client <- socket Req
+    randomChar <- liftIO $ getStdRandom . randomR $ ('A', 'Z')
+    setIdentity (restrict $ pack [randomChar]) client
+    liftIO $ putStrLn $ "2: Client " ++ [randomChar] ++ " started"
     connect client $ "ipc://" ++ broker ++ "-localfe.ipc"
     forever $ do
         send client [] $ pack "HELLO"
@@ -38,8 +40,10 @@ clientTask broker = do
 
 workerTask :: Broker -> ZMQ z ()
 workerTask broker = do
-    liftIO $ putStrLn "2: Worker started"
     worker <- socket Req
+    randomChar <- liftIO $ getStdRandom . randomR $ ('a', 'z')
+    setIdentity (restrict $ pack [randomChar]) worker
+    liftIO $ putStrLn $ "2: Worker " ++ [randomChar] ++ " started"
     connect worker $ "ipc://" ++ broker ++ "-localbe.ipc"
     send worker [] $ pack $ [chr 1]
     forever $ do
@@ -60,9 +64,10 @@ handleLocal peers workers sockets evts = do
     liftIO $ putStrLn "2: Local message received"
     when (In `elem` evts) $ do
         msg <- map unpack <$> receiveMulti (localBE sockets)
+        liftIO $ putStrLn $ "8: Local message:" ++ (unwords msg)
         let workerName = head msg
             msg' = tail msg
-        when (head msg' /= [chr 1]) $ do
+        when ((head msg') /= [chr 1]) $ do
             routeMessage peers (localFE sockets) (cloudFE sockets) msg'
         routeClients peers workers sockets
         routeTraffic peers (workers ++ [workerName]) sockets
@@ -74,32 +79,36 @@ routeClients peers workers sockets = do
                                  Sock (cloudFE sockets) [In] Nothing]
     if In `elem` evtsC then do
         msg <- receiveMessage (cloudFE sockets)
-        liftIO $ putStrLn $ "4: Cloud FE message" ++ (unwords msg) ++ "."
+        liftIO $ putStrLn $ "4: Cloud FE message:" ++ (unwords msg) ++ "."
+        liftIO $ putStrLn $ "7: sendToWorker:" ++ (head workers) ++ (unwords msg) ++ "."
         sendToWorker (localBE sockets) (head workers) msg
         routeClients peers (tail workers) sockets
     else
         if In `elem` evtsL then do
             msg <- receiveMessage (localFE sockets)
-            liftIO $ putStrLn $ "4: Local FE message" ++ (unwords msg) ++ "."
+            liftIO $ putStrLn $ "4: Local FE message:" ++ (unwords msg) ++ "."
             randomChance <- liftIO $ getRandomInt (1,5)
             randomPeer <- liftIO $ getRandomInt (1, length peers)
             let (dest, sock) = if randomChance == 1 then
                         (peers !! (randomPeer - 1), cloudBE sockets)
                     else
                         (head workers, localBE sockets)
+            liftIO $ putStrLn $ "6: sendToWorker:" ++ dest ++ (unwords msg) ++ "."
             sendToWorker sock dest msg
             routeClients peers (tail workers) sockets
         else return ()
 
 sendToWorker :: (Sender a) => Socket z a -> Worker -> [String] -> ZMQ z ()
-sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : msg
+sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : "" : msg
 
 routeMessage :: (Sender a) => [Broker] -> Socket z a -> Socket z a -> [String] -> ZMQ z ()
 routeMessage peers localFront cloudFront msg = do
     let msg' = map pack $ msg
-    if (head msg `elem` peers) then
+    if (head msg `elem` peers) then do
+        liftIO $ putStrLn $ "5: Routing cloud message:" ++ (unwords msg) ++ "."
         sendMulti cloudFront (fromList msg')
-    else
+    else do
+        liftIO $ putStrLn $ "5: Routing local message:" ++ (unwords msg) ++ "."
         sendMulti localFront (fromList msg')
 
 routeTraffic :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z ()
