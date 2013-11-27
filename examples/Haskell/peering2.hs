@@ -20,6 +20,9 @@ data SocketGroup z a = SocketGroup {
     , cloudBE :: Socket z a
 }
 
+workerReady :: String
+workerReady = "1"
+
 getRandomInt :: (Int,Int) -> IO Int
 getRandomInt = getStdRandom . randomR
 
@@ -35,7 +38,8 @@ clientTask broker = do
     connect client $ "ipc://" ++ broker ++ "-localfe.ipc"
     forever $ do
         send client [] $ pack "HELLO"
-        receive client >>= \msg -> liftIO $ putStrLn $ unwords ["Client:", (unpack msg)]
+        receiveMessage client >>= \msg -> liftIO $ putStrLn $ unwords $ "Client:" : msg
+        liftIO $ putStrLn $ unwords $ ["Client" , [randomChar] , "proceeding"]
         liftIO $ threadDelay $ 1 * 1000
 
 workerTask :: Broker -> ZMQ z ()
@@ -45,10 +49,11 @@ workerTask broker = do
     setIdentity (restrict $ pack [randomChar]) worker
     liftIO $ putStrLn $ "2: Worker " ++ [randomChar] ++ " started"
     connect worker $ "ipc://" ++ broker ++ "-localbe.ipc"
-    send worker [] $ pack $ [chr 1]
+    send worker [] $ pack $ workerReady
     forever $ do
-        receive worker >>= \msg -> liftIO $ putStrLn $ unwords ["Worker:", (unpack msg)]
-        send worker [] $ pack "OK"
+        msg <- receiveMessage worker
+        liftIO $ putStrLn $ unwords $ "Worker" : [randomChar] : ":" : msg
+        sendToWorker worker (head msg) (tail (tail (init msg ++ ["OK"])))
 
 handleCloud :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> [Event] -> ZMQ z ()
 handleCloud peers workers sockets evts = do
@@ -67,14 +72,15 @@ handleLocal peers workers sockets evts = do
         liftIO $ putStrLn $ "8: Local message:" ++ (unwords msg)
         let workerName = head msg
             msg' = tail msg
-        when ((head msg') /= [chr 1]) $ do
+        when ((head msg') /= workerReady) $ do
             routeMessage peers (localFE sockets) (cloudFE sockets) msg'
-        routeClients peers workers sockets
-        routeTraffic peers (workers ++ [workerName]) sockets
+        newWorkers <- routeClients peers (workers ++ [workerName]) sockets
+        routeTraffic peers newWorkers sockets
 
-routeClients :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z ()
-routeClients peers [] sockets = return ()
+routeClients :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z [Worker]
+routeClients peers [] sockets = return []
 routeClients peers workers sockets = do
+    liftIO $ putStrLn $ "9: Routing " ++ (unwords workers) ++ "."
     [evtsL, evtsC] <- poll 1000 [Sock (localFE sockets) [In] Nothing,
                                  Sock (cloudFE sockets) [In] Nothing]
     if In `elem` evtsC then do
@@ -89,14 +95,14 @@ routeClients peers workers sockets = do
             liftIO $ putStrLn $ "4: Local FE message:" ++ (unwords msg) ++ "."
             randomChance <- liftIO $ getRandomInt (1,5)
             randomPeer <- liftIO $ getRandomInt (1, length peers)
-            let (dest, sock) = if randomChance == 1 then
-                        (peers !! (randomPeer - 1), cloudBE sockets)
+            let (dest, sock, newWorkers) = if randomChance == 1 then
+                        (peers !! (randomPeer - 1), cloudBE sockets, workers)
                     else
-                        (head workers, localBE sockets)
+                        (head workers, localBE sockets, tail workers)
             liftIO $ putStrLn $ "6: sendToWorker:" ++ dest ++ (unwords msg) ++ "."
             sendToWorker sock dest msg
-            routeClients peers (tail workers) sockets
-        else return ()
+            routeClients peers newWorkers sockets
+        else return workers
 
 sendToWorker :: (Sender a) => Socket z a -> Worker -> [String] -> ZMQ z ()
 sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : "" : msg
