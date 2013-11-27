@@ -21,7 +21,7 @@ data SocketGroup z a = SocketGroup {
 }
 
 workerReady :: String
-workerReady = "1"
+workerReady = [chr 1]
 
 getRandomInt :: (Int,Int) -> IO Int
 getRandomInt = getStdRandom . randomR
@@ -36,6 +36,9 @@ unwrapMessage msg = let msg' = tail msg
                           (target, tail msg')
                       else
                           (target, msg')
+
+sendToWorker :: (Sender a) => Socket z a -> Worker -> [String] -> ZMQ z ()
+sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : "" : msg
 
 clientTask :: Broker -> ZMQ z ()
 clientTask broker = do
@@ -96,9 +99,6 @@ routeClients peers workers sockets = do
             sendToWorker sock dest msg
             routeClients peers newWorkers sockets
         else return workers
-
-sendToWorker :: (Sender a) => Socket z a -> Worker -> [String] -> ZMQ z ()
-sendToWorker sock worker msg = sendMulti sock $ fromList $ map pack $ worker : "" : msg
 
 routeMessage :: (Sender a) => [Broker] -> Socket z a -> Socket z a -> [String] -> ZMQ z ()
 routeMessage peers localFront cloudFront msg = do
