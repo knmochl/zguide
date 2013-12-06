@@ -3,7 +3,7 @@ import System.Exit (exitWith, ExitCode(..))
 import Data.ByteString.Char8 (pack, unpack)
 import Data.Char (chr)
 import Data.List.NonEmpty (fromList)
-import Control.Monad (forM_, forever, when, replicateM_)
+import Control.Monad (forM_, forever, when, replicateM_, replicateM)
 import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
 import Text.Printf
@@ -62,7 +62,7 @@ clientTask client monitor = do
     sleepTime <- liftIO $ getRandomInt (1,5)
     messageCount <- liftIO $ getRandomInt (1,15)
     liftIO $ threadDelay $ sleepTime * 1000
-    replicateM_ messageCount $ do
+    statuses <- replicateM messageCount $ do
         randomTask <- liftIO $ getRandomInt (0, 16 * 16 * 16 * 16)
         let taskId = printf "%04X" randomTask
         send client [] $ pack taskId
@@ -71,11 +71,17 @@ clientTask client monitor = do
             msg <- receiveMessage client
             if taskId == (head msg) then do
                 send monitor [] $ pack $ head msg
+                return True
             else do
                 send monitor [] $ pack $ "Wrong task: " ++ (head msg)
+                return False
         else do
             send monitor [] $ pack $ "Lost task: " ++ taskId
-    clientTask client monitor
+            return False
+    if False `elem` statuses then
+        return ()
+    else
+        clientTask client monitor
 
 workerTask :: Broker -> ZMQ z ()
 workerTask broker = do
@@ -89,14 +95,53 @@ workerTask broker = do
         liftIO $ threadDelay $ sleepTime * 1000
         sendToWorker worker target msg'
 
+routeMessage :: (Sender a) => [Broker] -> Socket z a -> Socket z a -> [String] -> ZMQ z ()
+routeMessage peers localFront cloudFront msg = do
+    let msg' = map pack $ msg
+    if (head msg `elem` peers) then do
+        sendMulti cloudFront (fromList msg')
+    else do
+        sendMulti localFront (fromList msg')
+
+routeClients :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z [Worker]
+routeClients peers [] sockets = return []
+routeClients peers workers sockets = do
+    [evtsL, evtsC] <- poll 1000 [Sock (localFE sockets) [In] Nothing,
+                                 Sock (cloudFE sockets) [In] Nothing]
+    if In `elem` evtsC then do
+        msg <- receiveMessage (cloudFE sockets)
+        sendToWorker (localBE sockets) (head workers) msg
+        routeClients peers (tail workers) sockets
+    else
+        if In `elem` evtsL then do
+            msg <- receiveMessage (localFE sockets)
+            randomChance <- liftIO $ getRandomInt (1,5)
+            randomPeer <- liftIO $ getRandomInt (1, length peers)
+            let (dest, sock, newWorkers) = if randomChance == 1 then
+                        (peers !! (randomPeer - 1), cloudBE sockets, workers)
+                    else
+                        (head workers, localBE sockets, tail workers)
+            sendToWorker sock dest msg
+            routeClients peers newWorkers sockets
+        else return workers
+
+handleLocal :: (Receiver router) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
+handleLocal peers workers sockets evts = do
+    when (In `elem` evts) $ do
+        msg <- receiveMessage (localBE sockets)
+        let (workerName, msg') = unwrapMessage msg
+        when ((head msg') /= workerReady) $ do
+            routeMessage peers (localFE sockets) (cloudFE sockets) msg'
+        newWorkers <- routeClients peers (workers ++ [workerName]) sockets
+        routeTraffic peers newWorkers sockets
+
 routeTraffic :: [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> ZMQ z ()
 routeTraffic peers workers sockets = do
     let timeout = if workers == [] then (-1) else 1000
-    evts <- poll timeout [Sock (localBE sockets) [In] Nothing,
-                          Sock (cloudBE sockets) [In] Nothing,
-                          Sock (stateFE sockets) [In] Nothing,
-                          Sock (mon sockets) [In] Nothing]
-    return ()
+    poll timeout [Sock (localBE sockets) [In] (Just $ handleLocal peers workers sockets),
+                  Sock (cloudBE sockets) [In] (Just $ handleCloud peers workers sockets),
+                  Sock (stateFE sockets) [In] (Just $ handleState peers workers sockets),
+                  Sock (mon sockets) [In] (Just $ handleMon peers workers sockets)]
 
 main = do
     args <- getArgs
