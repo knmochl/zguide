@@ -139,8 +139,13 @@ handleLocal peers workers sockets evts = do
         let (workerName, msg') = unwrapMessage msg
         when ((head msg') /= workerReady) $ do
             routeMessage peers (localFE sockets) (cloudFE sockets) msg'
-        newWorkers <- routeClients peers (workers ++ [workerName]) 0 sockets
+        let workerList = workers ++ [workerName]
+        newWorkers <- routeClients peers workerList 0 sockets
+        when ((length workerList) /= (length newWorkers)) $ sendCloudCapacity (stateBE sockets) (length workers)
         routeTraffic peers newWorkers sockets
+
+sendCloudCapacity :: (Sender pub) => Socket z pub -> Int -> ZMQ z ()
+sendCloudCapacity sock capacity = send sock [] $ pack $ show capacity
 
 handleState :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleState peers workers sockets evts = do
