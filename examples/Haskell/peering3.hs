@@ -103,45 +103,70 @@ routeMessage peers localFront cloudFront msg = do
     else do
         sendMulti localFront (fromList msg')
 
-routeClients :: (Receiver a, Sender a) => [Broker] -> [Worker] -> SocketGroup z a -> ZMQ z [Worker]
-routeClients peers [] sockets = return []
-routeClients peers workers sockets = do
-    [evtsL, evtsC] <- poll 1000 [Sock (localFE sockets) [In] Nothing,
-                                 Sock (cloudFE sockets) [In] Nothing]
-    if In `elem` evtsC then do
+routeClients :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> Int ->  SocketGroup z router sub pub pull -> ZMQ z [Worker]
+routeClients peers [] 0 sockets = return []
+routeClients peers workers cloud sockets = do
+    let pollList = Sock (localFE sockets) [In] Nothing : if workers == [] then [] else [Sock (cloudFE sockets) [In] Nothing]
+    evtsList <- poll 0 pollList
+    if In `elem` (evtsList !! 0) then do
         msg <- receiveMessage (cloudFE sockets)
         sendToWorker (localBE sockets) (head workers) msg
-        routeClients peers (tail workers) sockets
+        routeClients peers (tail workers) cloud sockets
     else
-        if In `elem` evtsL then do
+        if (length evtsList > 1) && (In `elem` (evtsList !! 1)) then do
             msg <- receiveMessage (localFE sockets)
-            randomChance <- liftIO $ getRandomInt (1,5)
             randomPeer <- liftIO $ getRandomInt (1, length peers)
-            let (dest, sock, newWorkers) = if randomChance == 1 then
-                        (peers !! (randomPeer - 1), cloudBE sockets, workers)
+            let (dest, sock, newWorkers, newCloud) = if workers == [] then
+                        (peers !! (randomPeer - 1), cloudBE sockets, workers, cloud - 1)
                     else
-                        (head workers, localBE sockets, tail workers)
+                        (head workers, localBE sockets, tail workers, cloud)
             sendToWorker sock dest msg
-            routeClients peers newWorkers sockets
+            routeClients peers newWorkers cloud sockets
         else return workers
 
-handleLocal :: (Receiver router) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
+handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z()
+handleCloud peers workers sockets evts = do
+    when (In `elem` evts) $ do
+        msg <- receiveMessage (cloudBE sockets)
+        let (_, msg') = unwrapMessage msg
+        routeMessage peers (localFE sockets) (cloudFE sockets) msg'
+        routeTraffic peers workers sockets
+
+handleLocal :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleLocal peers workers sockets evts = do
     when (In `elem` evts) $ do
         msg <- receiveMessage (localBE sockets)
         let (workerName, msg') = unwrapMessage msg
         when ((head msg') /= workerReady) $ do
             routeMessage peers (localFE sockets) (cloudFE sockets) msg'
-        newWorkers <- routeClients peers (workers ++ [workerName]) sockets
+        newWorkers <- routeClients peers (workers ++ [workerName]) 0 sockets
         routeTraffic peers newWorkers sockets
 
-routeTraffic :: [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> ZMQ z ()
+handleState :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
+handleState peers workers sockets evts = do
+    when (In `elem` evts) $ do
+        msg <- receiveMessage (stateFE sockets)
+        let (_, msg') = unwrapMessage msg
+        let cloudCount = read . head $ msg
+        newWorkers <- routeClients peers workers cloudCount sockets
+        routeTraffic peers newWorkers sockets
+
+handleMon :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
+handleMon peers workers sockets evts = do
+    when (In `elem` evts) $ do
+        msg <- receiveMessage (mon sockets)
+        liftIO $ putStrLn (head msg)
+        routeTraffic peers workers sockets
+
+routeTraffic :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> ZMQ z ()
 routeTraffic peers workers sockets = do
     let timeout = if workers == [] then (-1) else 1000
     poll timeout [Sock (localBE sockets) [In] (Just $ handleLocal peers workers sockets),
                   Sock (cloudBE sockets) [In] (Just $ handleCloud peers workers sockets),
                   Sock (stateFE sockets) [In] (Just $ handleState peers workers sockets),
                   Sock (mon sockets) [In] (Just $ handleMon peers workers sockets)]
+    newWorkers <- routeClients peers workers 0 sockets
+    routeTraffic peers newWorkers sockets
 
 main = do
     args <- getArgs
