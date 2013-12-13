@@ -65,7 +65,6 @@ clientTask client monitor = do
     statuses <- replicateM messageCount $ do
         randomTask <- liftIO $ getRandomInt (0, 16 * 16 * 16 * 16)
         let taskId = printf "%04X" randomTask
-        liftIO $ putStrLn $ "Client sending " ++ taskId
         send client [] $ pack taskId
         [evts] <- poll (10 * 1000) [Sock client [In] Nothing]
         if In `elem` evts then do
@@ -107,16 +106,15 @@ routeMessage peers localFront cloudFront msg = do
 routeClients :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> Int ->  SocketGroup z router sub pub pull -> ZMQ z [Worker]
 routeClients peers [] 0 sockets = return []
 routeClients peers workers cloud sockets = do
-    liftIO $ putStrLn "routeClients: Enter"
     let pollList = Sock (localFE sockets) [In] Nothing : if workers == [] then [] else [Sock (cloudFE sockets) [In] Nothing]
     evtsList <- poll 0 pollList
     if In `elem` (evtsList !! 0) then do
-        msg <- receiveMessage (cloudFE sockets)
+        msg <- receiveMessage (localFE sockets)
         sendToWorker (localBE sockets) (head workers) msg
         routeClients peers (tail workers) cloud sockets
     else
         if (length evtsList > 1) && (In `elem` (evtsList !! 1)) then do
-            msg <- receiveMessage (localFE sockets)
+            msg <- receiveMessage (cloudFE sockets)
             randomPeer <- liftIO $ getRandomInt (1, length peers)
             let (dest, sock, newWorkers, newCloud) = if workers == [] then
                         (peers !! (randomPeer - 1), cloudBE sockets, workers, cloud - 1)
@@ -129,7 +127,6 @@ routeClients peers workers cloud sockets = do
 handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z()
 handleCloud peers workers sockets evts = do
     when (In `elem` evts) $ do
-        liftIO $ putStrLn "handleCloud: Enter"
         msg <- receiveMessage (cloudBE sockets)
         let (_, msg') = unwrapMessage msg
         routeMessage peers (localFE sockets) (cloudFE sockets) msg'
@@ -138,7 +135,6 @@ handleCloud peers workers sockets evts = do
 handleLocal :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleLocal peers workers sockets evts = do
     when (In `elem` evts) $ do
-        liftIO $ putStrLn "handleLocal: Enter"
         msg <- receiveMessage (localBE sockets)
         let (workerName, msg') = unwrapMessage msg
         when ((head msg') /= workerReady) $ do
@@ -151,7 +147,6 @@ handleLocal peers workers sockets evts = do
 handleState :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleState peers workers sockets evts = do
     when (In `elem` evts) $ do
-        liftIO $ putStrLn "handleState: Enter"
         msg <- receiveMessage (stateFE sockets)
         let (_, msg') = unwrapMessage msg
         let cloudCount = read . head $ msg'
