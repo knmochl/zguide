@@ -27,10 +27,10 @@ workerReady :: String
 workerReady = [chr 1]
 
 numWorkers :: Int
-numWorkers = 10
+numWorkers = 5
 
 numClients :: Int
-numClients = 5
+numClients = 10
 
 getRandomInt :: (Int,Int) -> IO Int
 getRandomInt = getStdRandom . randomR
@@ -124,7 +124,7 @@ routeClients peers workers cloud sockets = do
             routeClients peers newWorkers cloud sockets
         else return workers
 
-handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z()
+handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleCloud peers workers sockets evts = do
     when (In `elem` evts) $ do
         msg <- receiveMessage (cloudBE sockets)
@@ -155,7 +155,8 @@ handleState peers workers sockets evts = do
         routeTraffic peers newWorkers sockets
 
 updateCloud :: (Sender a) => Int -> Int -> Socket z a -> ZMQ z ()
-updateCloud old new sock = when (old /= new) $ sendToWorker sock "me" [show new]
+updateCloud old new sock = when (old /= new) $ do
+    sendToWorker sock "me" [show new]
 
 handleMon :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 handleMon peers workers sockets evts = do
