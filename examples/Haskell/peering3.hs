@@ -6,11 +6,11 @@ import Data.List.NonEmpty (fromList)
 import Control.Monad (forM_, forever, when, replicateM_, replicateM)
 import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
-import Text.Printf
+import Text.Printf (printf)
 import System.Random (getStdRandom, randomR)
+import Control.Monad.Reader (ReaderT(..), ask)
+import Control.Monad.State (StateT(..), get, put, lift)
 import System.ZMQ3.Monadic
-import Control.Monad.Reader
-import Control.Monad.State
 
 type Worker = String
 type Broker = String
@@ -32,6 +32,7 @@ data AppState = AppState {
     , cloudCapacity :: Int
 }
 
+type App z router sub pub pull = ReaderT (AppConfig z router sub pub pull) (StateT AppState (ZMQ z))
 
 workerReady :: String
 workerReady = [chr 1]
@@ -77,7 +78,7 @@ clientTask :: (Receiver a, Sender a, Sender b) => Socket z a -> Socket z b -> ZM
 clientTask client monitor = do
     sleepTime <- liftIO $ getRandomInt (1,5)
     messageCount <- liftIO $ getRandomInt (1,15)
-    liftIO $ threadDelay $ sleepTime * 1000
+    liftIO $ threadDelay $ sleepTime * 1000000
     statuses <- replicateM messageCount $ do
         randomTask <- liftIO $ getRandomInt (0, 16 * 16 * 16 * 16)
         let taskId = printf "%04X" randomTask
@@ -108,18 +109,21 @@ workerTask broker = do
         msg <- receiveMessage worker
         let (target, msg') = unwrapMessage msg
         sleepTime <- liftIO $ getRandomInt (0,1)
-        liftIO $ threadDelay $ sleepTime * 1000
+        liftIO $ threadDelay $ sleepTime * 1000 * 1000
         sendToWorker worker target msg'
 
-routeMessage :: (Sender a) => [Broker] -> Socket z a -> Socket z a -> [String] -> ZMQ z ()
-routeMessage peers localFront cloudFront msg = do
+routeMessage :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [String] -> App z router sub pub pull ()
+routeMessage msg = do
+    cfg <- ask
     let msg' = map pack $ msg
+        peers = peerList cfg
+        cloud = cloudFE cfg
+        local = localFE cfg
     if (head msg `elem` peers) then do
-        sendMulti cloudFront (fromList msg')
+        lift (lift (sendMulti cloud (fromList msg')))
     else do
-        sendMulti localFront (fromList msg')
+        lift (lift (sendMulti local (fromList msg')))
 
---routeClients = undefined
 routeClients :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => App z router sub pub pull ()
 routeClients = do
     cfg <- ask
@@ -132,46 +136,49 @@ routeClients = do
         evtsList <- poll 0 pollList
         if In `elem` (evtsList !! 0) then do
             msg <- appReceiveMessage (localFE cfg)
-            appSendToWorker (localBE cfg) (head workers) msg
-            put st { workerList = (tail workers), cloudCapacity = cloud }
+            randomPeer <- liftIO $ getRandomInt (1, length peers)
+            let (dest, sock, newWorkers, newCloud) = if workers == [] then
+                        (peers !! (randomPeer - 1), cloudBE cfg, workers, cloud - 1)
+                    else
+                        (head workers, localBE cfg, tail workers, cloud)
+            appSendToWorker sock dest msg
+            put st { workerList = newWorkers, cloudCapacity = newCloud }
             routeClients
         else
             if (length evtsList > 1) && (In `elem` (evtsList !! 1)) then do
                 msg <- appReceiveMessage (cloudFE cfg)
-                randomPeer <- liftIO $ getRandomInt (1, length peers)
-                let (dest, sock, newWorkers, newCloud) = if workers == [] then
-                            (peers !! (randomPeer - 1), cloudBE cfg, workers, cloud - 1)
-                        else
-                            (head workers, localBE cfg, tail workers, cloud)
-                appSendToWorker sock dest msg
-                put st { workerList = newWorkers, cloudCapacity = newCloud }
+                appSendToWorker (localBE cfg) (head workers) msg
+                put st { workerList = (tail workers), cloudCapacity = cloud }
                 routeClients
             else return ()
     else return ()
 
-handleCloud evts = undefined
---handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
---handleCloud peers workers sockets evts = do
---    when (In `elem` evts) $ do
---        msg <- receiveMessage (cloudBE sockets)
---        let (_, msg') = unwrapMessage msg
---        routeMessage peers (localFE sockets) (cloudFE sockets) msg'
---        routeTraffic peers workers sockets
---
-handleLocal evts = undefined
---handleLocal :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
---handleLocal peers workers sockets evts = do
---    when (In `elem` evts) $ do
---        msg <- receiveMessage (localBE sockets)
---        let (workerName, msg') = unwrapMessage msg
---        when ((head msg') /= workerReady) $ do
---            routeMessage peers (localFE sockets) (cloudFE sockets) msg'
---        let workerList = workers ++ [workerName]
---        newWorkers <- routeClients peers workerList 0 sockets
---        updateCloud (length workerList) (length newWorkers) (stateBE sockets)
---        routeTraffic peers newWorkers sockets
---
---handleState evts = undefined
+handleCloud :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Event] -> App z router sub pub pull ()
+handleCloud evts = do
+    when (In `elem` evts) $ do
+        cfg <- ask
+        msg <- appReceiveMessage (cloudBE cfg)
+        let (_, msg') = unwrapMessage msg
+        routeMessage msg'
+        routeTraffic
+
+handleLocal :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Event] -> App z router sub pub pull ()
+handleLocal evts = do
+    when (In `elem` evts) $ do
+        cfg <- ask
+        st <- get
+        msg <- appReceiveMessage (localBE cfg)
+        let (workerName, msg') = unwrapMessage msg
+        when ((head msg') /= workerReady) $ do
+            routeMessage msg'
+        let workers = (workerList st) ++ [workerName]
+        put st { workerList = workers, cloudCapacity = (cloudCapacity st) }
+        routeClients
+        st' <- get
+        let newWorkers = workerList st'
+        updateCloud (length workers) (length newWorkers) (stateBE cfg)
+        routeTraffic
+
 handleState :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Event] -> App z router sub pub pull ()
 handleState evts = do
     when (In `elem` evts) $ do
@@ -188,14 +195,10 @@ handleState evts = do
         updateCloud (length workers) (length newWorkers) (stateBE cfg)
         routeTraffic
 
---updateCloud a b c = undefined
 updateCloud :: (Sender a) => Int -> Int -> Socket z a -> App z router sub pub pull ()
 updateCloud old new sock = when (old /= new) $ do
     cfg <- ask
     appSendToWorker sock (name cfg) [show new]
---
---handleMon evts = undefined
---handleMon :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Broker] -> [Worker] -> SocketGroup z router sub pub pull -> [Event] -> ZMQ z ()
 
 handleMon :: (Receiver pull, Receiver router, Sender router, Receiver sub, Sender pub) => [Event] -> App z router sub pub pull ()
 handleMon evts = do
@@ -204,8 +207,6 @@ handleMon evts = do
         msg <- appReceiveMessage (mon cfg)
         liftIO $ putStrLn (head msg)
         routeTraffic
-
-type App z router sub pub pull = ReaderT (AppConfig z router sub pub pull) (StateT AppState (ZMQ z))
 
 routeTraffic :: (Receiver pull, Receiver router, Sender router, Sender pub, Receiver sub) => App z router sub pub pull ()
 routeTraffic = do
@@ -259,4 +260,3 @@ main = do
         let config = AppConfig me peers localFront localBack cloudFront cloudBack stateFront stateBack monitor
             state = AppState [] 0
         runStateT (runReaderT routeTraffic config) state
-        liftIO $ putStrLn "foo"
